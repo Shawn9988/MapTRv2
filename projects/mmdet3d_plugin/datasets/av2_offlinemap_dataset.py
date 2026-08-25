@@ -555,6 +555,7 @@ class VectorizedAV2LocalMap(object):
         super().__init__()
 
         self.vec_classes = map_classes
+        self.class2label = {name: label for label, name in enumerate(map_classes)}
 
 
         self.sample_dist = sample_dist
@@ -586,7 +587,7 @@ class VectorizedAV2LocalMap(object):
                 if instance.shape[0] < 2:
                     # print('class : {}, instance : {}, instance_list : {}'.format(vec_class, instance, instance_list))
                     continue
-                vectors.append((LineString(np.array(instance)), self.CLASS2LABEL.get(vec_class, -1)))
+                vectors.append((LineString(np.array(instance)), self.class2label.get(vec_class, -1)))
         filtered_vectors = []
         gt_pts_loc_3d = []
         gt_pts_num_3d = []
@@ -899,7 +900,9 @@ class CustomAV2OfflineLocalMapDataset(CustomNuScenesDataset):
         """
         convert sample queue into one single sample.
         """
-        imgs_list = [each['img'].data for each in queue]
+        has_img = 'img' in queue[-1]
+        if has_img:
+            imgs_list = [each['img'].data for each in queue]
         metas_map = {}
         prev_pos = None
         prev_angle = None
@@ -920,8 +923,11 @@ class CustomAV2OfflineLocalMapDataset(CustomNuScenesDataset):
                 prev_pos = copy.deepcopy(tmp_pos)
                 prev_angle = copy.deepcopy(tmp_angle)
 
-        queue[-1]['img'] = DC(torch.stack(imgs_list),
-                              cpu_only=False, stack=True)
+        if has_img:
+            queue[-1]['img'] = DC(torch.stack(imgs_list),
+                                  cpu_only=False, stack=True)
+        elif 'points' in queue[-1]:
+            queue[-1]['points'] = queue[-1]['points']
         queue[-1]['img_metas'] = DC(metas_map, cpu_only=True)
         queue = queue[-1]
         return queue

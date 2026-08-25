@@ -255,5 +255,11 @@ def main():
         meta=meta)
 
 
+import debugpy
+if 0:
+	debugpy.listen(("0.0.0.0", 5678))
+	print("🔥 waiting for debugger attach...")
+	debugpy.wait_for_client()
+
 if __name__ == '__main__':
     main()

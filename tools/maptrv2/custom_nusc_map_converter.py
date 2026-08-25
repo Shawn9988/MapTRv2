@@ -110,6 +110,29 @@ def to_patch_coord(new_polygon, patch_angle, patch_x, patch_y):
 
 
 
+RADAR_TYPES = [
+    'RADAR_FRONT',
+    'RADAR_FRONT_LEFT',
+    'RADAR_FRONT_RIGHT',
+    'RADAR_BACK_LEFT',
+    'RADAR_BACK_RIGHT',
+]
+WARNED_MISSING_LIDAR_BLOB = False
+
+
+def sample_data_file_exists(nusc, token):
+    sd_rec = nusc.get('sample_data', token)
+    return osp.isfile(osp.join(nusc.dataroot, sd_rec['filename']))
+
+
+def sample_has_any_radar_file(nusc, sample_rec):
+    for radar in RADAR_TYPES:
+        if radar in sample_rec['data'] and sample_data_file_exists(
+                nusc, sample_rec['data'][radar]):
+            return True
+    return False
+
+
 def get_available_scenes(nusc):
     """Get available scenes from the input nuscenes class.
 
@@ -129,21 +152,36 @@ def get_available_scenes(nusc):
         scene_token = scene['token']
         scene_rec = nusc.get('scene', scene_token)
         sample_rec = nusc.get('sample', scene_rec['first_sample_token'])
-        sd_rec = nusc.get('sample_data', sample_rec['data']['LIDAR_TOP'])
-        has_more_frames = True
         scene_not_exist = False
-        while has_more_frames:
-            lidar_path, boxes, _ = nusc.get_sample_data(sd_rec['token'])
-            lidar_path = str(lidar_path)
-            if os.getcwd() in lidar_path:
-                # path from lyftdataset is absolute path
-                lidar_path = lidar_path.split(f'{os.getcwd()}/')[-1]
-                # relative path
-            if not mmcv.is_filepath(lidar_path):
+        if 'LIDAR_TOP' in sample_rec['data'] and sample_data_file_exists(
+                nusc, sample_rec['data']['LIDAR_TOP']):
+            scene_not_exist = False
+        elif sample_has_any_radar_file(nusc, sample_rec):
+            # Radar-only download: keep the scene if at least one radar
+            # keyframe exists. LIDAR_TOP metadata is still used as the local
+            # reference frame, but the actual lidar blob is not required.
+            scene_not_exist = False
+        else:
+            sd_rec = nusc.get('sample_data', sample_rec['data']['LIDAR_TOP'])
+            has_more_frames = True
+            while has_more_frames:
+                lidar_path, boxes, _ = nusc.get_sample_data(sd_rec['token'])
+                lidar_path = str(lidar_path)
+                if os.getcwd() in lidar_path:
+                    # path from lyftdataset is absolute path
+                    lidar_path = lidar_path.split(f'{os.getcwd()}/')[-1]
+                    # relative path
+                if not mmcv.is_filepath(lidar_path):
+                    scene_not_exist = True
+                    break
+                else:
+                    break
+                if sd_rec['next'] != '':
+                    sd_rec = nusc.get('sample_data', sd_rec['next'])
+                else:
+                    has_more_frames = False
+            if not has_more_frames:
                 scene_not_exist = True
-                break
-            else:
-                break
         if scene_not_exist:
             continue
         available_scenes.append(scene)
@@ -151,6 +189,8 @@ def get_available_scenes(nusc):
     return available_scenes
 
 def _get_can_bus_info(nusc, nusc_can_bus, sample):
+    if nusc_can_bus is None:
+        return np.zeros(18)
     scene_name = nusc.get('scene', sample['scene_token'])['name']
     sample_timestamp = sample['timestamp']
     try:
@@ -245,6 +285,7 @@ def _fill_trainval_infos(nusc,
                          val_scenes,
                          test=False,
                          max_sweeps=10,
+                         max_samples=-1,
                          point_cloud_range=[-15.0, -30.0,-10.0, 15.0, 30.0, 10.0]):
     """Generate the train/val infos from the raw data.
 
@@ -263,7 +304,11 @@ def _fill_trainval_infos(nusc,
     train_nusc_infos = []
     val_nusc_infos = []
     frame_idx = 0
-    for sample in mmcv.track_iter_progress(nusc.sample):
+    samples = nusc.sample
+    if max_samples is not None and max_samples > 0:
+        samples = samples[:max_samples]
+        print(f'WARN: max_samples={max_samples}, only processing first {len(samples)} samples.')
+    for sample in mmcv.track_iter_progress(samples):
         map_location = nusc.get('log', nusc.get('scene', sample['scene_token'])['log_token'])['location']
 
         lidar_token = sample['data']['LIDAR_TOP']
@@ -273,7 +318,11 @@ def _fill_trainval_infos(nusc,
         pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
         lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
 
-        mmcv.check_file_exist(lidar_path)
+        global WARNED_MISSING_LIDAR_BLOB
+        if not osp.isfile(lidar_path) and not WARNED_MISSING_LIDAR_BLOB:
+            print('WARN: missing LIDAR_TOP blobs; using LIDAR_TOP metadata '
+                  f'as local reference only. First missing file: {lidar_path}')
+            WARNED_MISSING_LIDAR_BLOB = True
         can_bus = _get_can_bus_info(nusc, nusc_can_bus, sample)
         ##
         info = {
@@ -285,6 +334,7 @@ def _fill_trainval_infos(nusc,
             'frame_idx': frame_idx,  # temporal related info
             'sweeps': [],
             'cams': dict(),
+            'radars': dict(),
             'map_location': map_location,
             'scene_token': sample['scene_token'],  # temporal related info
             'lidar2ego_translation': cs_record['translation'],
@@ -322,6 +372,25 @@ def _fill_trainval_infos(nusc,
                                          e2g_t, e2g_r_mat, cam)
             cam_info.update(cam_intrinsic=cam_intrinsic)
             info['cams'].update({cam: cam_info})
+
+        for radar in RADAR_TYPES:
+            radar_token = sample['data'][radar]
+            radar_info = obtain_sensor2top(nusc, radar_token, l2e_t,
+                                           l2e_r_mat, e2g_t, e2g_r_mat,
+                                           radar)
+            radar_sd_rec = nusc.get('sample_data', radar_token)
+            radar_sweeps = []
+            while len(radar_sweeps) < max_sweeps:
+                if radar_sd_rec['prev'] != '':
+                    radar_sweep = obtain_sensor2top(
+                        nusc, radar_sd_rec['prev'], l2e_t, l2e_r_mat,
+                        e2g_t, e2g_r_mat, radar)
+                    radar_sweeps.append(radar_sweep)
+                    radar_sd_rec = nusc.get('sample_data', radar_sd_rec['prev'])
+                else:
+                    break
+            radar_info['sweeps'] = radar_sweeps
+            info['radars'].update({radar: radar_info})
 
         # obtain sweeps for a single key-frame
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
@@ -758,7 +827,8 @@ def create_nuscenes_infos(root_path,
                           can_bus_root_path,
                           info_prefix,
                           version='v1.0-trainval',
-                          max_sweeps=10):
+                          max_sweeps=10,
+                          max_samples=-1):
     """Create info file of nuscene dataset.
 
     Given the raw data, generate its related info file in pkl format.
@@ -775,7 +845,12 @@ def create_nuscenes_infos(root_path,
     from nuscenes.can_bus.can_bus_api import NuScenesCanBus
     print(version, root_path)
     nusc = NuScenes(version=version, dataroot=root_path, verbose=True)
-    nusc_can_bus = NuScenesCanBus(dataroot=can_bus_root_path)
+    try:
+        nusc_can_bus = NuScenesCanBus(dataroot=can_bus_root_path)
+    except Exception as e:
+        print(f'WARN: failed to load nuScenes CAN bus from {can_bus_root_path}: {e}')
+        print('WARN: using zero can_bus vectors instead.')
+        nusc_can_bus = None
     MAPS = ['boston-seaport', 'singapore-hollandvillage',
                      'singapore-onenorth', 'singapore-queenstown']
     nusc_maps = {}
@@ -823,7 +898,8 @@ def create_nuscenes_infos(root_path,
             len(train_scenes), len(val_scenes)))
 
     train_nusc_infos, val_nusc_infos = _fill_trainval_infos(
-        nusc, nusc_can_bus, nusc_maps, map_explorer, train_scenes, val_scenes, test, max_sweeps=max_sweeps)
+        nusc, nusc_can_bus, nusc_maps, map_explorer, train_scenes, val_scenes,
+        test, max_sweeps=max_sweeps, max_samples=max_samples)
 
     metadata = dict(version=version)
     if test:
@@ -852,7 +928,8 @@ def nuscenes_data_prep(root_path,
                        version,
                        dataset_name,
                        out_dir,
-                       max_sweeps=10):
+                       max_sweeps=10,
+                       max_samples=-1):
     """Prepare data related to nuScenes dataset.
 
     Related data consists of '.pkl' files recording basic infos,
@@ -867,7 +944,8 @@ def nuscenes_data_prep(root_path,
         max_sweeps (int): Number of input consecutive frames. Default: 10
     """
     create_nuscenes_infos(
-        root_path, out_dir, can_bus_root_path, info_prefix, version=version, max_sweeps=max_sweeps)
+        root_path, out_dir, can_bus_root_path, info_prefix, version=version,
+        max_sweeps=max_sweeps, max_samples=max_samples)
 
     # if version == 'v1.0-test':
     #     info_test_path = osp.join(
@@ -912,6 +990,12 @@ parser.add_argument(
     required=False,
     help='specify sweeps of lidar per example')
 parser.add_argument(
+    '--max-samples',
+    type=int,
+    default=-1,
+    required=False,
+    help='maximum number of samples to convert; -1 means all samples')
+parser.add_argument(
     '--out-dir',
     type=str,
     default='./data/kitti',
@@ -924,21 +1008,34 @@ args = parser.parse_args()
 
 
 if __name__ == '__main__':
-    train_version = f'{args.version}-trainval'
-    nuscenes_data_prep(
-        root_path=args.root_path,
-        can_bus_root_path=args.canbus,
-        info_prefix=args.extra_tag,
-        version=train_version,
-        dataset_name='NuScenesDataset',
-        out_dir=args.out_dir,
-        max_sweeps=args.max_sweeps)
-    test_version = f'{args.version}-test'
-    nuscenes_data_prep(
-        root_path=args.root_path,
-        can_bus_root_path=args.canbus,
-        info_prefix=args.extra_tag,
-        version=test_version,
-        dataset_name='NuScenesDataset',
-        out_dir=args.out_dir,
-        max_sweeps=args.max_sweeps)
+    if args.version in ['v1.0-mini', 'v1.0-trainval', 'v1.0-test']:
+        nuscenes_data_prep(
+            root_path=args.root_path,
+            can_bus_root_path=args.canbus,
+            info_prefix=args.extra_tag,
+            version=args.version,
+            dataset_name='NuScenesDataset',
+            out_dir=args.out_dir,
+            max_sweeps=args.max_sweeps,
+            max_samples=args.max_samples)
+    else:
+        train_version = f'{args.version}-trainval'
+        nuscenes_data_prep(
+            root_path=args.root_path,
+            can_bus_root_path=args.canbus,
+            info_prefix=args.extra_tag,
+            version=train_version,
+            dataset_name='NuScenesDataset',
+            out_dir=args.out_dir,
+            max_sweeps=args.max_sweeps,
+            max_samples=args.max_samples)
+        test_version = f'{args.version}-test'
+        nuscenes_data_prep(
+            root_path=args.root_path,
+            can_bus_root_path=args.canbus,
+            info_prefix=args.extra_tag,
+            version=test_version,
+            dataset_name='NuScenesDataset',
+            out_dir=args.out_dir,
+            max_sweeps=args.max_sweeps,
+            max_samples=args.max_samples)

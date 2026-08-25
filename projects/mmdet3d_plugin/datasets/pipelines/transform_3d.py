@@ -1,9 +1,118 @@
+import copy
+import math
+
+import cv2
 import numpy as np
 from numpy import random
 import mmcv
 from mmdet.datasets.builder import PIPELINES
 from mmcv.parallel import DataContainer as DC
 import torch
+
+
+@PIPELINES.register_module()
+class XDMapGeometricAug(object):
+    """Geometric augmentation for the XD raster+vector dataset.
+
+    Applies ONE affine (shift + rotate + scale) to BOTH the raster image and
+    the GT boundary vectors so they stay aligned. No left-right (s) flip.
+
+    The raster is isotropic: image cols map to x, rows map to y (y-axis flipped
+    w.r.t. rows). The affine is defined in metre space (origin at BEV centre)
+    and converted to the pixel-space matrix from ``pc_range`` + image size, so
+    image and vectors receive exactly the same physical transform.
+
+    Args:
+        prob (float): probability to apply the whole augmentation.
+        max_shift_m (float): max |shift| per axis, in metres.
+        max_rotate_deg (float): max |rotation|, in degrees (about BEV centre).
+        scale_range (tuple): (lo, hi) uniform scale range.
+    """
+
+    def __init__(self,
+                 prob=0.5,
+                 max_shift_m=1.5,
+                 max_rotate_deg=8.0,
+                 scale_range=(0.9, 1.1)):
+        self.prob = prob
+        self.max_shift_m = max_shift_m
+        self.max_rotate_deg = max_rotate_deg
+        self.scale_range = scale_range
+
+    def __call__(self, results):
+        if random.rand() > self.prob:
+            return results
+
+        # ---- sample transform params (metre space) ----
+        tx = random.uniform(-self.max_shift_m, self.max_shift_m)
+        ty = random.uniform(-self.max_shift_m, self.max_shift_m)
+        theta = math.radians(
+            random.uniform(-self.max_rotate_deg, self.max_rotate_deg))
+        sc = random.uniform(self.scale_range[0], self.scale_range[1])
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        # metre transform: p' = M @ p + t
+        M = np.array([[sc * cos_t, -sc * sin_t],
+                      [sc * sin_t,  sc * cos_t]], dtype=np.float64)
+        t = np.array([tx, ty], dtype=np.float64)
+
+        # ---- image ----
+        img = results['raster_img']
+        is_dc = isinstance(img, DC)
+        tensor = img.data if is_dc else img
+        _, H, W = tensor.shape
+        pc_range = results['pc_range']
+        x_min, y_min, x_max, y_max = (pc_range[0], pc_range[1],
+                                      pc_range[3], pc_range[4])
+        res_x = (x_max - x_min) / (W - 1)
+        res_y = (y_max - y_min) / (H - 1)
+        # pixel <-> metre:  p_m = Ap @ p_px + bp ,  p_px = Am @ p_m + bm
+        Ap = np.array([[res_x, 0.0], [0.0, -res_y]])
+        bp = np.array([x_min, y_max])
+        Am = np.array([[1.0 / res_x, 0.0], [0.0, -1.0 / res_y]])
+        bm = np.array([-x_min / res_x, y_max / res_y])
+        # pixel-space affine equivalent to the metre-space (M, t)
+        P = Am @ M @ Ap
+        offset = Am @ (M @ bp + t) + bm
+        warp_mat = np.concatenate([P, offset.reshape(2, 1)], axis=1).astype(np.float32)
+
+        img_np = np.ascontiguousarray(
+            tensor.numpy().transpose(1, 2, 0))  # HWC
+        warped = cv2.warpAffine(
+            img_np, warp_mat, (W, H),
+            flags=cv2.INTER_NEAREST,           # keep sparse radar / thin lines
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        if warped.ndim == 2:
+            warped = warped[..., None]
+        out = torch.from_numpy(
+            np.ascontiguousarray(warped.transpose(2, 0, 1))).float()
+        results['raster_img'] = DC(out, stack=True) if is_dc else out
+
+        # ---- GT vectors (same metre-space transform) ----
+        ann = copy.deepcopy(results['annotation'])
+        for key, lines in ann.items():
+            if not isinstance(lines, list):
+                continue
+            new_lines = []
+            for line in lines:
+                pts = np.asarray(line, dtype=np.float64)
+                if pts.ndim != 2 or pts.shape[0] < 2:
+                    new_lines.append(line)
+                    continue
+                xy = pts[:, :2] @ M.T + t
+                if pts.shape[1] > 2:
+                    xy = np.concatenate([xy, pts[:, 2:]], axis=1)
+                new_lines.append(xy.tolist())
+            ann[key] = new_lines
+        results['annotation'] = ann
+        return results
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}(prob={self.prob}, '
+                f'max_shift_m={self.max_shift_m}, '
+                f'max_rotate_deg={self.max_rotate_deg}, '
+                f'scale_range={self.scale_range})')
+
+
 @PIPELINES.register_module()
 class PadMultiViewImage(object):
     """Pad the multi-view image.

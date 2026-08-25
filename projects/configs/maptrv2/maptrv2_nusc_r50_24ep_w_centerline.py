@@ -320,7 +320,7 @@ lr_config = dict(
     min_lr_ratio=1e-3)
 total_epochs = 24
 evaluation = dict(interval=2, pipeline=test_pipeline, metric='chamfer',
-                  save_best='NuscMap_chamfer/mAP', rule='greater')
+                  save_best='XdMap_chamfer/mAP', rule='greater')
 # total_epochs = 50
 # evaluation = dict(interval=1, pipeline=test_pipeline)
 

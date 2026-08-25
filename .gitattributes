@@ -1,0 +1,9 @@
+# 普通文本文件统一仓库内保存为LF
+* text=auto eol=lf
+
+# 二进制文件禁止换行转换
+*.png binary
+*.jpg binary
+*.zip binary
+*.pth binary
+*.bin binary

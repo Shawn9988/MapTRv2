@@ -65,7 +65,8 @@ class MapTRPerceptionTransformer(BaseModule):
                  feat_down_sample_indice=-1,
                  **kwargs):
         super(MapTRPerceptionTransformer, self).__init__(**kwargs)
-        if modality == 'fusion':
+        self.modality = modality
+        if modality in ('fusion', 'lidar', 'raster') and fuser is not None:
             self.fuser = build_fuser(fuser) #TODO
         # self.use_attn_bev = encoder['type'] == 'BEVFormerEncoder'
         self.use_attn_bev = 'BEVFormerEncoder' in encoder['type']
@@ -252,6 +253,18 @@ class MapTRPerceptionTransformer(BaseModule):
         """
         obtain bev features.
         """
+        if self.modality in ('lidar', 'raster'):
+            assert lidar_feat is not None
+            if self.modality == 'lidar':
+                lidar_feat = lidar_feat.permute(0,1,3,2).contiguous() # B C H W
+            lidar_feat = nn.functional.interpolate(
+                lidar_feat, size=(bev_h, bev_w), mode='bicubic',
+                align_corners=False)
+            if hasattr(self, 'fuser'):
+                lidar_feat = self.fuser([lidar_feat])
+            bev_embed = lidar_feat.flatten(2).permute(0,2,1).contiguous()
+            return dict(bev=bev_embed, depth=None)
+
         if self.use_attn_bev:
             ret_dict = self.attn_bev_encode(
                 mlvl_feats,

@@ -22,11 +22,24 @@ class CustomNuScenesDataset(NuScenesDataset):
     This datset only add camera intrinsics and extrinsics to the results.
     """
 
-    def __init__(self, queue_length=4, bev_size=(200, 200), overlap_test=False, *args, **kwargs):
+    def __init__(self,
+                 queue_length=4,
+                 bev_size=(200, 200),
+                 overlap_test=False,
+                 max_samples=None,
+                 *args,
+                 **kwargs):
+        self.max_samples = max_samples
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
         self.overlap_test = overlap_test
         self.bev_size = bev_size
+
+    def load_annotations(self, ann_file):
+        data_infos = super().load_annotations(ann_file)
+        if self.max_samples is not None and self.max_samples > 0:
+            data_infos = data_infos[:self.max_samples]
+        return data_infos
         
     def prepare_train_data(self, index):
         """

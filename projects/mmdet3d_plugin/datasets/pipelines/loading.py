@@ -3,6 +3,7 @@ from typing import Any, Dict, Tuple
 
 import mmcv
 import numpy as np
+from mmcv.parallel import DataContainer as DC
 from nuscenes.map_expansion.map_api import NuScenesMap
 from nuscenes.map_expansion.map_api import locations as LOCATIONS
 from PIL import Image
@@ -15,7 +16,9 @@ from mmdet.datasets.pipelines import LoadAnnotations
 from .loading_utils import load_augmented_point_cloud, reduce_LiDAR_beams
 
 import torch
+import torch.nn.functional as F
 from pyquaternion import Quaternion
+from nuscenes.utils.data_classes import RadarPointCloud
 
 @PIPELINES.register_module()
 class CustomLoadMultiViewImageFromFiles(object):
@@ -151,6 +154,9 @@ class CustomLoadPointsFromMultiSweeps:
             )
         elif lidar_path.endswith(".npy"):
             points = np.load(lidar_path)
+        elif lidar_path.endswith(".feather"):
+            import pandas as pd
+            points = pd.read_feather(lidar_path).to_numpy(dtype=np.float32)
         else:
             points = np.fromfile(lidar_path, dtype=np.float32)
         return points
@@ -220,7 +226,9 @@ class CustomLoadPointsFromMultiSweeps:
             for idx in choices:
                 sweep = results["sweeps"][idx]
                 points_sweep = self._load_points(sweep["data_path"])
-                points_sweep = np.copy(points_sweep).reshape(-1, self.load_dim)
+                points_sweep = np.copy(points_sweep)
+                if points_sweep.ndim == 1:
+                    points_sweep = points_sweep.reshape(-1, self.load_dim)
 
                 # TODO: make it more general
                 if self.reduce_beams and self.reduce_beams < 32:
@@ -312,6 +320,9 @@ class CustomLoadPointsFromFile:
             )
         elif lidar_path.endswith(".npy"):
             points = np.load(lidar_path)
+        elif lidar_path.endswith(".feather"):
+            import pandas as pd
+            points = pd.read_feather(lidar_path).to_numpy(dtype=np.float32)
         else:
             points = np.fromfile(lidar_path, dtype=np.float32)
 
@@ -331,7 +342,8 @@ class CustomLoadPointsFromFile:
         """
         lidar_path = results["lidar_path"]
         points = self._load_points(lidar_path)
-        points = points.reshape(-1, self.load_dim)
+        if points.ndim == 1:
+            points = points.reshape(-1, self.load_dim)
         # TODO: make it more general
         if self.reduce_beams and self.reduce_beams < 32:
             points = reduce_LiDAR_beams(points, self.reduce_beams)
@@ -367,6 +379,163 @@ class CustomLoadPointsFromFile:
         results["points"] = points
 
         return results
+
+
+@PIPELINES.register_module()
+class LoadRasterMapImage:
+    """Load one BEV raster image for MapTR vector decoding."""
+
+    def __init__(self,
+                 to_float32=True,
+                 color_type='grayscale',
+                 invert=True,
+                 normalize=True,
+                 density_kernel=5):
+        self.to_float32 = to_float32
+        self.color_type = color_type
+        self.invert = invert
+        self.normalize = normalize
+        self.density_kernel = density_kernel
+
+    def __call__(self, results):
+        filename = results['raster_img_path']
+        img = mmcv.imread(filename, flag=self.color_type)
+        if img is None:
+            raise FileNotFoundError(filename)
+        if self.to_float32:
+            img = img.astype(np.float32)
+        if self.normalize:
+            img = img / 255.0
+        if self.invert:
+            img = 1.0 - img
+        if img.ndim == 2:
+            tensor = torch.from_numpy(img[None, ...]).float()
+            num_channels = 1
+        else:
+            tensor = torch.from_numpy(img.transpose(2, 0, 1)).float()
+            num_channels = img.shape[2]
+
+        # ===================== 毫米波密度+通道加权逻辑 =====================
+        # mmcv.imread 为 BGR：通道0=radar(B)、通道1=lane(G)、通道2=traj(R)
+        if num_channels == 3:
+            radar_raw = tensor[0:1, ...]  # 通道0：毫米波蓝点原始栅格（主信号）
+            lane = tensor[1:2, ...]       # 通道1：车道绿线
+            traj = tensor[2:3, ...]       # 通道2：轨迹红线
+
+            # 1. 计算毫米波局部密度热力
+            k = self.density_kernel
+            kernel = torch.ones((1, 1, k, k), dtype=tensor.dtype) / (k * k)
+            radar_density = F.conv2d(radar_raw[None, ...], kernel, padding=k//2)[0]
+
+            # 2. 通道权重缩放：增强 radar，弱化 lane/traj（仅作引导）
+            radar_enh = radar_density * 2.0
+            lane_w = lane * 0.4
+            traj_w = traj * 0.8
+
+            # 3. 保持 BGR 通道顺序输出 3 通道
+            tensor = torch.cat([radar_enh, lane_w, traj_w], dim=0)
+        # =======================================================================
+
+        results['raster_img'] = DC(tensor, stack=True)
+        results['filename'] = filename
+        results['ori_shape'] = img.shape
+        results['img_shape'] = img.shape
+        results['pad_shape'] = img.shape
+        results['img_norm_cfg'] = dict(
+            mean=np.zeros(num_channels, dtype=np.float32),
+            std=np.ones(num_channels, dtype=np.float32),
+            to_rgb=False)
+        return results
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}(color_type={self.color_type}, '
+                f'invert={self.invert}, '
+                f'normalize={self.normalize})')
+
+
+@PIPELINES.register_module()
+class CustomLoadRadarPointsFromMultiSweeps:
+    """Load nuScenes radar points and transform them to LiDAR coordinates."""
+
+    def __init__(
+        self,
+        coord_type='LIDAR',
+        sweeps_num=3,
+        load_dim=6,
+        use_dim=[0, 1, 2, 3, 4, 5],
+        test_mode=False,
+        disable_filters=True,
+    ):
+        assert coord_type in ["LIDAR"]
+        if isinstance(use_dim, int):
+            use_dim = list(range(use_dim))
+        assert max(use_dim) < load_dim
+        self.coord_type = coord_type
+        self.sweeps_num = sweeps_num
+        self.load_dim = load_dim
+        self.use_dim = use_dim
+        self.test_mode = test_mode
+        self.disable_filters = disable_filters
+
+    def _load_radar_points(self, radar_info, ref_ts):
+        data_path = radar_info['data_path']
+        mmcv.check_file_exist(data_path)
+        if self.disable_filters:
+            RadarPointCloud.disable_filters()
+        radar_points = RadarPointCloud.from_file(data_path).points.T
+
+        points = np.zeros((radar_points.shape[0], self.load_dim),
+                          dtype=np.float32)
+        if radar_points.shape[0] == 0:
+            return points
+
+        points[:, :3] = radar_points[:, :3]
+        points[:, :3] = points[:, :3] @ radar_info[
+            'sensor2lidar_rotation'].T
+        points[:, :3] += radar_info['sensor2lidar_translation']
+
+        points[:, 3] = radar_points[:, 5]  # rcs
+        points[:, 4] = np.linalg.norm(radar_points[:, 8:10], axis=1)
+        points[:, 5] = ref_ts - radar_info['timestamp'] / 1e6
+        return points
+
+    def __call__(self, results):
+        radar_infos = results['radars']
+        if len(radar_infos) == 0:
+            raise KeyError(
+                'Radar infos are missing. Re-run custom_nusc_map_converter.py '
+                'to regenerate nuscenes_map_infos_temporal_*.pkl.')
+        ref_ts = results['timestamp'] / 1e6
+        points_list = []
+
+        for radar_info in radar_infos.values():
+            points_list.append(self._load_radar_points(radar_info, ref_ts))
+            sweeps = radar_info.get('sweeps', [])
+            if len(sweeps) <= self.sweeps_num:
+                choices = np.arange(len(sweeps))
+            elif self.test_mode:
+                choices = np.arange(self.sweeps_num)
+            else:
+                choices = np.random.choice(
+                    len(sweeps), self.sweeps_num, replace=False)
+            for idx in choices:
+                points_list.append(self._load_radar_points(
+                    sweeps[idx], ref_ts))
+
+        if len(points_list) == 0:
+            points = np.zeros((0, self.load_dim), dtype=np.float32)
+        else:
+            points = np.concatenate(points_list, axis=0)
+        points = points[:, self.use_dim]
+
+        points_class = get_points_type(self.coord_type)
+        results['points'] = points_class(
+            points, points_dim=points.shape[-1], attribute_dims=None)
+        return results
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}(sweeps_num={self.sweeps_num}, "
+                f"use_dim={self.use_dim})")
 
 
 @PIPELINES.register_module()

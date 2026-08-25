@@ -1,2 +1,6 @@
 shapely==1.8.5.post1
-av2
+# Install av2 separately with:
+# pip install av2 --no-deps
+#
+# Plain `av2` pulls kornia -> torch from PyPI, which can overwrite the
+# MapTRv2-compatible torch 1.9.x/cu111 environment.

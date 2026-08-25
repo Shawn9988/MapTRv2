@@ -129,6 +129,8 @@ class MapTRv2Head(DETRHead):
                               pos_weight=2.13,
                               loss_weight=1.0),
                  loss_dir=dict(type='PtsDirCosLoss', loss_weight=2.0),
+                 partial_positive=False,
+                 partial_bg_weight=0.05,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -192,6 +194,12 @@ class MapTRv2Head(DETRHead):
         self.loss_seg = build_loss(loss_seg)
         self.loss_pv_seg = build_loss(loss_pv_seg)
         
+        # partial positive: down-weight background/neg cls loss to tolerate
+        # incomplete GT. Disabled by default; only enable for algo-generated
+        # (missing) GT, not for complete hand-labeled GT.
+        self.partial_positive = partial_positive
+        self.partial_bg_weight = partial_bg_weight
+
         self._init_layers()
 
     def _init_layers(self):
@@ -537,6 +545,10 @@ class MapTRv2Head(DETRHead):
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
         label_weights = gt_bboxes.new_ones(num_bboxes)
 
+        #add for partial positive 0623
+        if self.partial_positive:
+            label_weights[neg_inds] = self.partial_bg_weight
+
         # bbox targets
         bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_c]
         bbox_weights = torch.zeros_like(bbox_pred)
@@ -713,11 +725,37 @@ class MapTRv2Head(DETRHead):
             pts_preds = pts_preds.permute(0,2,1).contiguous()
 
         # import pdb;pdb.set_trace()
-        loss_pts = self.loss_pts(
-            pts_preds[isnotnan,:,:], normalized_pts_targets[isnotnan,
-                                                            :,:], 
-            pts_weights[isnotnan,:,:],
-            avg_factor=num_total_pos)
+        #测试向内惩罚权重
+        if 1:
+            # 取有效预测、GT
+            pred_valid = pts_preds[isnotnan,:,:]    # [N, P, 2]
+            gt_valid = normalized_pts_targets[isnotnan,:,:] # [N, P, 2]
+            w_valid = pts_weights[isnotnan,:,:]     # [N, P]
+
+            # 横向偏移（假设Y是道路左右横向，根据你坐标系替换为0/X）
+            delta_lat = pred_valid[..., 1] - gt_valid[..., 1]
+            # 判断是否向内收缩
+            inside_mask = torch.sign(delta_lat) * torch.sign(gt_valid[..., 1]) < 0
+
+            # 向内点位权重×3，向外保持1
+            w_enhance = w_valid.clone()
+            w_enhance[inside_mask] *= 3.0
+
+            # 替换原权重送入chamfer
+            loss_pts = self.loss_pts(
+                pred_valid, 
+                gt_valid, 
+                w_enhance,  # 替换 pts_weights
+                avg_factor=num_total_pos
+            )
+        else:
+            #原始maptr loss pts的权重
+            loss_pts = self.loss_pts(
+                pts_preds[isnotnan,:,:], normalized_pts_targets[isnotnan,
+                                                                :,:], 
+                pts_weights[isnotnan,:,:],
+                avg_factor=num_total_pos)
+        
         dir_weights = pts_weights[:, :-self.dir_interval,0]
         denormed_pts_preds = denormalize_2d_pts(pts_preds, self.pc_range) if not self.z_cfg['gt_z_flag'] \
                                 else denormalize_3d_pts(pts_preds, self.pc_range)

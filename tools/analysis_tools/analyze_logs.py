@@ -95,6 +95,13 @@ def plot_curve(log_dicts, args):
                     ys.append(np.array(log_dict[epoch][metric][:len(iters)]))
                 xs = np.concatenate(xs)
                 ys = np.concatenate(ys)
+                if args.last_iters is not None:
+                    if args.last_iters <= 0:
+                        raise ValueError('--last-iters must be positive')
+                    start_iter = xs[-1] - args.last_iters + 1
+                    keep = xs >= start_iter
+                    xs = xs[keep]
+                    ys = ys[keep]
                 plt.xlabel('iter')
                 plt.plot(
                     xs, ys, label=legend[i * num_metrics + j], linewidth=0.5)
@@ -137,6 +144,11 @@ def add_plot_parser(subparsers):
     parser_plt.add_argument('--out', type=str, default=None)
     parser_plt.add_argument('--mode', type=str, default='train')
     parser_plt.add_argument('--interval', type=int, default=1)
+    parser_plt.add_argument(
+        '--last-iters',
+        type=int,
+        default=None,
+        help='only plot the latest N iterations in train mode')
 
 
 def add_time_parser(subparsers):

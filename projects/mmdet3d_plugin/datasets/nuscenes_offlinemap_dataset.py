@@ -558,6 +558,7 @@ class VectorizedLocalMap(object):
         super().__init__()
 
         self.vec_classes = map_classes
+        self.class2label = {name: label for label, name in enumerate(map_classes)}
 
 
         self.sample_dist = sample_dist
@@ -583,7 +584,7 @@ class VectorizedLocalMap(object):
         for vec_class in self.vec_classes:
             instance_list = map_annotation[vec_class]
             for instance in instance_list:
-                vectors.append((LineString(np.array(instance)), self.CLASS2LABEL.get(vec_class, -1))) 
+                vectors.append((LineString(np.array(instance)), self.class2label.get(vec_class, -1))) 
         # import pdb;pdb.set_trace()
         filtered_vectors = []
         gt_pts_loc_3d = []
@@ -1192,7 +1193,9 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
         convert sample queue into one single sample.
         """
         # import ipdb;ipdb.set_trace()
-        imgs_list = [each['img'].data for each in queue]
+        has_img = 'img' in queue[-1]
+        if has_img:
+            imgs_list = [each['img'].data for each in queue]
         metas_map = {}
         prev_pos = None
         prev_angle = None
@@ -1230,8 +1233,11 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
                 prev_angle = copy.deepcopy(tmp_angle)
                 prev_lidar2global = copy.deepcopy(tmp_lidar2global)
 
-        queue[-1]['img'] = DC(torch.stack(imgs_list),
-                              cpu_only=False, stack=True)
+        if has_img:
+            queue[-1]['img'] = DC(torch.stack(imgs_list),
+                                  cpu_only=False, stack=True)
+        elif 'points' in queue[-1]:
+            queue[-1]['points'] = queue[-1]['points']
         queue[-1]['img_metas'] = DC(metas_map, cpu_only=True)
         queue = queue[-1]
         return queue
@@ -1262,6 +1268,7 @@ class CustomNuScenesOfflineLocalMapDataset(CustomNuScenesDataset):
             pts_filename=info['lidar_path'],
             lidar_path=info["lidar_path"],
             sweeps=info['sweeps'],
+            radars=info.get('radars', {}),
             ego2global_translation=info['ego2global_translation'],
             ego2global_rotation=info['ego2global_rotation'],
             lidar2ego_translation=info['lidar2ego_translation'],

@@ -10,6 +10,39 @@ from mmcv.runner import force_fp32, auto_fp16
 from mmdet3d.ops import Voxelization, DynamicScatter
 from mmdet3d.models import builder
 from mmcv.utils import TORCH_VERSION, digit_version
+
+
+class SimpleRasterEncoder(nn.Module):
+    def __init__(self,
+                 in_channels=1,
+                 out_channels=256,
+                 channels=(32, 64, 128, 256)):
+        super().__init__()
+        layers = []
+        prev_channels = in_channels
+        for i, channels_i in enumerate(channels):
+            stride = 1 if i == 0 else 2
+            layers.extend([
+                nn.Conv2d(prev_channels, channels_i, 3, stride=stride,
+                          padding=1, bias=False),
+                nn.BatchNorm2d(channels_i),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channels_i, channels_i, 3, padding=1, bias=False),
+                nn.BatchNorm2d(channels_i),
+                nn.ReLU(inplace=True),
+            ])
+            prev_channels = channels_i
+        layers.extend([
+            nn.Conv2d(prev_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        ])
+        self.encoder = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
 @DETECTORS.register_module()
 class MapTRv2(MVXTwoStageDetector):
     """MapTR.
@@ -36,6 +69,7 @@ class MapTRv2(MVXTwoStageDetector):
                  video_test_mode=False,
                  modality='vision',
                  lidar_encoder=None,
+                 raster_encoder=None,
                  ):
 
         super(MapTRv2,
@@ -58,7 +92,7 @@ class MapTRv2(MVXTwoStageDetector):
             'prev_angle': 0,
         }
         self.modality = modality
-        if self.modality == 'fusion' and lidar_encoder is not None :
+        if self.modality in ('fusion', 'lidar') and lidar_encoder is not None :
             if lidar_encoder["voxelize"].get("max_num_points", -1) > 0:
                 voxelize_module = Voxelization(**lidar_encoder["voxelize"])
             else:
@@ -70,6 +104,13 @@ class MapTRv2(MVXTwoStageDetector):
                 }
             )
             self.voxelize_reduce = lidar_encoder.get("voxelize_reduce", True)
+        if self.modality == 'raster':
+            raster_encoder = raster_encoder or {}
+            self.raster_modal_extractor = SimpleRasterEncoder(
+                in_channels=raster_encoder.get('in_channels', 1),
+                out_channels=raster_encoder.get('out_channels', 256),
+                channels=tuple(raster_encoder.get(
+                    'channels', (32, 64, 128, 256))))
 
 
     def extract_img_feat(self, img, img_metas, len_queue=None):
@@ -255,10 +296,20 @@ class MapTRv2(MVXTwoStageDetector):
         
         return lidar_feat
 
+    def build_dummy_img_feats(self, lidar_feat):
+        bs = lidar_feat.size(0)
+        embed_dims = self.pts_bbox_head.embed_dims
+        return [lidar_feat.new_zeros((bs, 1, embed_dims, 1, 1))]
+
+    @auto_fp16(apply_to=('raster_img'), out_fp32=True)
+    def extract_raster_feat(self, raster_img):
+        return self.raster_modal_extractor(raster_img)
+
     # @auto_fp16(apply_to=('img', 'points'))
-    @force_fp32(apply_to=('img','points','prev_bev'))
+    @force_fp32(apply_to=('img','points','prev_bev','raster_img'))
     def forward_train(self,
                       points=None,
+                      raster_img=None,
                       img_metas=None,
                       gt_bboxes_3d=None,
                       gt_labels_3d=None,
@@ -297,8 +348,33 @@ class MapTRv2(MVXTwoStageDetector):
             dict: Losses of different branches.
         """
         lidar_feat = None
-        if self.modality == 'fusion':
+        if self.modality in ('fusion', 'lidar'):
             lidar_feat = self.extract_lidar_feat(points)
+
+        if self.modality == 'raster':
+            raster_feat = self.extract_raster_feat(raster_img)
+            if isinstance(img_metas[0], list):
+                img_metas = [each[-1] for each in img_metas]
+            img_feats = self.build_dummy_img_feats(raster_feat)
+            losses = dict()
+            losses_pts = self.forward_pts_train(
+                img_feats, raster_feat, gt_bboxes_3d, gt_labels_3d,
+                img_metas, gt_bboxes_ignore, None, gt_depth, gt_seg_mask,
+                gt_pv_seg_mask)
+            losses.update(losses_pts)
+            return losses
+
+        if self.modality == 'lidar':
+            if isinstance(img_metas[0], list):
+                img_metas = [each[-1] for each in img_metas]
+            img_feats = self.build_dummy_img_feats(lidar_feat)
+            losses = dict()
+            losses_pts = self.forward_pts_train(
+                img_feats, lidar_feat, gt_bboxes_3d, gt_labels_3d,
+                img_metas, gt_bboxes_ignore, None, gt_depth, gt_seg_mask,
+                gt_pv_seg_mask)
+            losses.update(losses_pts)
+            return losses
         
         len_queue = img.size(1)
         prev_img = img[:, :-1, ...]
@@ -319,13 +395,16 @@ class MapTRv2(MVXTwoStageDetector):
         losses.update(losses_pts)
         return losses
 
-    def forward_test(self, img_metas, img=None,points=None,  **kwargs):
+    def forward_test(self, img_metas, img=None,points=None, raster_img=None,  **kwargs):
         for var, name in [(img_metas, 'img_metas')]:
             if not isinstance(var, list):
                 raise TypeError('{} must be a list, but got {}'.format(
                     name, type(var)))
+        if len(img_metas) > 0 and isinstance(img_metas[0], dict):
+            img_metas = [img_metas]
         img = [img] if img is None else img
         points = [points] if points is None else points
+        raster_img = [raster_img] if not isinstance(raster_img, list) else raster_img
         if img_metas[0][0]['scene_token'] != self.prev_frame_info['scene_token']:
             # the first sample of each scene is truncated
             self.prev_frame_info['prev_bev'] = None
@@ -347,7 +426,8 @@ class MapTRv2(MVXTwoStageDetector):
             img_metas[0][0]['can_bus'][:3] = 0
 
         new_prev_bev, bbox_results = self.simple_test(
-            img_metas[0], img[0], points[0], prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
+            img_metas[0], img[0], points[0], raster_img[0],
+            prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
         # During inference, we save the BEV features and ego motion of each timestamp.
         self.prev_frame_info['prev_pos'] = tmp_pos
         self.prev_frame_info['prev_angle'] = tmp_angle
@@ -395,12 +475,18 @@ class MapTRv2(MVXTwoStageDetector):
         ]
         # import pdb;pdb.set_trace()
         return outs['bev_embed'], bbox_results
-    def simple_test(self, img_metas, img=None, points=None, prev_bev=None, rescale=False, **kwargs):
+    def simple_test(self, img_metas, img=None, points=None, raster_img=None, prev_bev=None, rescale=False, **kwargs):
         """Test function without augmentaiton."""
         lidar_feat = None
-        if self.modality =='fusion':
+        if self.modality in ('fusion', 'lidar'):
             lidar_feat = self.extract_lidar_feat(points)
-        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        if self.modality == 'raster':
+            lidar_feat = self.extract_raster_feat(raster_img)
+            img_feats = self.build_dummy_img_feats(lidar_feat)
+        elif self.modality == 'lidar':
+            img_feats = self.build_dummy_img_feats(lidar_feat)
+        else:
+            img_feats = self.extract_feat(img=img, img_metas=img_metas)
 
         bbox_list = [dict() for i in range(len(img_metas))]
         new_prev_bev, bbox_pts = self.simple_test_pts(

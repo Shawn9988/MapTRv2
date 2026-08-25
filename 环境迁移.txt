@@ -1,0 +1,14 @@
+源服务器
+nvidia-smi
+
+which nvcc
+nvcc -V
+
+ls -l /usr/local/cuda*
+cat /usr/local/cuda/version.json 2>/dev/null || cat /usr/local/cuda/version.txt 2>/dev/null
+
+echo $CUDA_HOME
+echo $CUDA_PATH
+echo $LD_LIBRARY_PATH
+
+新服务器先保证 nvidia-smi 正常
